@@ -1,7 +1,7 @@
 #!/bin/bash
 
 WORK_DIR="/tmp/vpngate_test_$$"
-OUTPUT_DIR="$HOME/Загрузки/vpngate_working"
+OUTPUT_DIR="/workspace/vpngate_working"
 VPNGATE_URL="https://download.vpngate.jp/api/iphone/"
 ALTERNATE_URL="https://www.vpngate.net/api/iphone/"
 AUTH_LOGIN="vpn"

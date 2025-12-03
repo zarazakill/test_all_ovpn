@@ -1,1 +1,1 @@
-(diagnose_vpn.py is a source file, test_all_ovpn.sh is a script file - both are source code and should not be ignored)
+Nothing should be ignored based on the provided file changes, as they consist only of source/config files (.md, .ovpn, .sh) without any build artifacts, dependencies, or temporary files.
