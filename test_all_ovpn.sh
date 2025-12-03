@@ -138,7 +138,6 @@ ORIGINAL_IP=$(timeout 10 curl -s --max-time 8 https://api.ipify.org 2>/dev/null 
 echo "Текущий IP: $ORIGINAL_IP"
 
 # Функция для диагностики с использованием Python
-# Функция для диагностики с использованием Python
 diagnose_ovpn() {
     local config="$1"
     local log_file="./logs/vpngate_diagnose_$$.log"
