@@ -4,6 +4,7 @@ WORK_DIR="/tmp/vpngate_test_$$"
 OUTPUT_DIR="/workspace/vpngate_working"
 VPNGATE_URL="https://download.vpngate.jp/api/iphone/"
 ALTERNATE_URL="https://www.vpngate.net/api/iphone/"
+BACKUP_URL="https://vpngate.net/api/iphone/"
 AUTH_LOGIN="vpn"
 AUTH_PASS="vpn"
 
@@ -222,12 +223,24 @@ download_csv() {
     log "Загрузка с $url"
     
     curl -s --connect-timeout 30 --max-time 60 \
-         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+         -H "Accept: text/csv, text/plain, */*" \
+         -H "Accept-Language: en-US,en;q=0.9" \
+         -H "Referer: https://www.vpngate.net/" \
          "$url" -o "$output"
     
-    if [ -f "$output" ] && [ -s "$output" ] && ! grep -q "<html\|<!DOCTYPE" "$output" 2>/dev/null; then
+    # Проверяем, является ли содержимое CSV (начинается с 'HostName')
+    if [ -f "$output" ] && [ -s "$output" ] && head -1 "$output" | grep -q "^HostName,"; then
         log "✓ CSV загружен ($(wc -l < "$output") строк)"
         return 0
+    fi
+    
+    # Если не CSV, показываем начало файла для диагностики
+    if [ -f "$output" ] && [ -s "$output" ]; then
+        log "⚠️  Загруженный файл не является CSV, первые строки:"
+        head -5 "$output" | while read -r line; do
+            log "   $line"
+        done
     fi
     
     return 1
@@ -239,8 +252,15 @@ if download_csv "$VPNGATE_URL" "servers.csv"; then
     log "Основной URL сработал"
 elif download_csv "$ALTERNATE_URL" "servers.csv"; then
     log "Альтернативный URL сработал"
+elif download_csv "$BACKUP_URL" "servers.csv"; then
+    log "Резервный URL сработал"
 else
-    log "❌ Не удалось загрузить CSV файл"
+    log "❌ Не удалось загрузить CSV файл с любого из URL"
+    log "💡 Возможные причины:"
+    log "   - VPN Gate API больше не предоставляет открытый доступ"
+    log "   - Блокировка в вашем регионе"
+    log "   - Изменение формата API"
+    log "   - Требуется обновление скрипта для новых URL"
     exit 1
 fi
 
@@ -337,18 +357,39 @@ test_ovpn_config() {
         return 1
     fi
     
+    # Получаем информацию из конфига для диагностики
+    local remote_line=$(grep "^remote " "$config" | head -1)
+    local server=$(echo "$remote_line" | awk '{print $2}')
+    local port=$(echo "$remote_line" | awk '{print $3}')
+    port=${port:-1194}
+    local proto=$(grep "^proto " "$config" | awk '{print $2}' | head -1)
+    proto=${proto:-udp}
+    
+    log "  Тест $server:$port ($proto)"
+    
+    # Проверяем доступность порта
+    if command -v nc >/dev/null 2>&1; then
+        if ! timeout 5 nc -z "$server" "$port" 2>/dev/null; then
+            log "  ❌ Порт $port недоступен"
+            echo "❌ Порт недоступен"
+            return 1
+        else
+            log "  ✅ Порт $port доступен"
+        fi
+    fi
+    
     # Запускаем OpenVPN
     sudo openvpn \
         --config "$config" \
         --daemon \
         --writepid "$pid_file" \
         --log "$log_file" \
-        --verb 1 \
+        --verb 3 \
         --connect-timeout 20 \
         --auth-user-pass auth.txt
-    
+
     # Ждем подключения
-    for i in {1..20}; do
+    for i in {1..30}; do
         if [ -f "$log_file" ] && grep -q "Initialization Sequence Completed" "$log_file" 2>/dev/null; then
             sleep 2
             NEW_IP=$(timeout 5 curl -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '\n\r')
@@ -380,8 +421,14 @@ test_ovpn_config() {
         # Проверяем ошибки
         if [ -f "$log_file" ]; then
             if grep -q "AUTH_FAILED\|TLS Error\|Cannot load\|no start line" "$log_file"; then
-                ERROR=$(grep -i "error\|fail\|cannot" "$log_file" | tail -1)
+                ERROR=$(grep -i "error\|fail\|cannot\|refused" "$log_file" | tail -1)
                 echo "❌ ${ERROR:0:50}"
+                break
+            fi
+            
+            # Проверяем на ошибки соединения
+            if grep -q "Connection refused\|No route to host\|Network is unreachable" "$log_file"; then
+                echo "❌ Сервер недоступен"
                 break
             fi
         fi
@@ -395,6 +442,7 @@ test_ovpn_config() {
         sleep 1
     fi
     
+    echo "❌ НЕ РАБОТАЕТ"
     return 1
 }
 

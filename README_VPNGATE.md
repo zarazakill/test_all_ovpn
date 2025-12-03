@@ -1,6 +1,6 @@
 # VPN Gate OpenVPN Tester
 
-This script (`test_all_ovpn.sh`) is designed to:
+This script (`test_all_ovpn.sh`) was designed to:
 
 1. Download the VPN Gate server list from their API
 2. Parse the CSV to extract OpenVPN configurations
@@ -8,15 +8,26 @@ This script (`test_all_ovpn.sh`) is designed to:
 4. Test the configurations to find working VPN servers
 5. Save working configurations to the output directory
 
-## How to Use
+**⚠️ IMPORTANT: As of December 2025, the VPN Gate API is no longer accessible via the traditional endpoints used by this script. The script will not work with the current VPN Gate service.**
+
+## Current Status
+
+The VPN Gate API endpoints that this script attempts to use are no longer returning the expected CSV data:
+- `https://download.vpngate.jp/api/iphone/` - Returns HTML page
+- `https://www.vpngate.net/api/iphone/` - Returns HTML page
+- `https://vpngate.net/api/iphone/` - Returns redirect to main page
+
+## How to Use (with limitations)
 
 ```bash
 sudo ./test_all_ovpn.sh
 ```
 
+**Note**: This script will currently fail to download VPN configurations due to API unavailability.
+
 ## Script Features
 
-- Downloads VPN configurations from VPN Gate API
+- Downloads VPN configurations from VPN Gate API (currently non-functional)
 - Converts inline certificates to separate files for better compatibility
 - Tests up to 15 configurations automatically
 - Saves working configurations to `/workspace/vpngate_working/`
@@ -25,11 +36,12 @@ sudo ./test_all_ovpn.sh
 ## Common Issues
 
 ### 1. VPN Gate API Unavailable
-The most common issue is that VPN Gate endpoints may be blocked or unavailable in certain regions. The script tries two endpoints:
+The main issue is that VPN Gate endpoints no longer provide the CSV API used by this script. The script tries three endpoints:
 - `https://download.vpngate.jp/api/iphone/`
 - `https://www.vpngate.net/api/iphone/`
+- `https://vpngate.net/api/iphone/`
 
-If these return HTML instead of CSV data, the script will fail.
+All of these now return HTML instead of CSV data.
 
 ### 2. Dependencies
 The script requires:
@@ -43,22 +55,23 @@ The script requires sudo privileges to run OpenVPN connections.
 
 ## Troubleshooting
 
-1. **Check connectivity to VPN Gate:**
-   ```bash
-   curl -s https://download.vpngate.jp/api/iphone/ | head -5
-   ```
-   If this returns HTML instead of CSV data, the API may be inaccessible.
+1. **The script fails at the API download step** - This is expected due to API unavailability.
 
-2. **Manually test a configuration:**
+2. **Testing existing OVPN files:**
    ```bash
-   sudo openvpn --config /path/to/config.ovpn
+   # Use the diagnostic script to test existing configurations
+   python3 diagnose_vpn.py /path/to/config.ovpn
    ```
 
 3. **Check working configurations:**
-   After running the script, check the output directory:
+   The script creates a working directory but it will remain empty if no configurations are downloaded:
    ```bash
    ls -la /workspace/vpngate_working/
    ```
+
+## Solutions and Alternatives
+
+Please see [VPN_GATE_SOLUTIONS.md](VPN_GATE_SOLUTIONS.md) for detailed information about alternatives and workarounds.
 
 ## Output
 
@@ -71,3 +84,4 @@ The script requires sudo privileges to run OpenVPN connections.
 - The script limits testing to 15 configurations to save time
 - It stops after finding 3 working configurations
 - Default credentials (vpn/vpn) are used for authentication
+- **This script no longer functions as intended due to VPN Gate API changes**
