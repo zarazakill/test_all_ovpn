@@ -1,0 +1,8 @@
+```
+# Compiled and build artifacts
+*.o
+*.obj
+*.out
+test_vpngate_api
+vpngate_tester
+```
