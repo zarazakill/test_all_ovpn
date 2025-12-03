@@ -339,6 +339,16 @@ int main(int argc, char* argv[]) {
     std::cout << "=== VPN GATE TESTER (C++) ===" << std::endl;
 
     Config config;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--test" && i + 1 < argc) {
+            config.max_servers_to_test = std::stoi(argv[++i]);
+        } else if (arg == "--timeout" && i + 1 < argc) {
+            config.test_timeout = std::stoi(argv[++i]);
+        }
+    }
 
     // Инициализация curl
     curl_global_init(CURL_GLOBAL_DEFAULT);
