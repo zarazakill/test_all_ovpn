@@ -12,109 +12,192 @@ log() {
     echo "[$(date '+%H:%M:%S')] $1"
 }
 
-# Функция для исправления inline сертификатов в конфигурации
-fix_inline_certs() {
+# Функция для извлечения сертификатов из тегов и сохранения в отдельных файлах
+extract_certs_to_files() {
     local config_file="$1"
     local temp_file="${config_file}.tmp"
     
-    # Проверяем, есть ли inline данные
+    # Создаем директорию для сертификатов
+    local cert_dir="${config_file%.ovpn}_certs"
+    mkdir -p "$cert_dir"
+    
+    # Проверяем, есть ли inline данные в тегах
     if grep -q "<cert>" "$config_file" && grep -q "</cert>" "$config_file"; then
-        log "  Исправление inline сертификатов..."
+        log "  Извлечение сертификатов из тегов..."
         
-        # Создаем временный файл для исправленной конфигурации
-        > "$temp_file"
+        # Извлекаем клиентский сертификат
+        sed -n '/<cert>/,/<\/cert>/p' "$config_file" | sed '1d;$d' > "$cert_dir/client.crt"
         
-        # Обрабатываем файл построчно
-        while IFS= read -r line; do
-            # Если находим открывающий тег cert/key/ca, начинаем извлечение
-            if [[ "$line" =~ ^\<(cert|key|ca)\>$ ]]; then
-                tag="${BASH_REMATCH[1]}"
-                content=""
-                
-                # Читаем содержимое до закрывающего тега
-                while IFS= read -r inner_line; do
-                    if [[ "$inner_line" =~ ^\</$tag\>$ ]]; then
-                        break
-                    fi
-                    content+="$inner_line"$'\n'
-                done
-                
-                # Пишем правильный формат PEM
-                echo "<$tag>" >> "$temp_file"
-                echo "-----BEGIN ${tag^^}-----" >> "$temp_file"
-                # Убираем лишние пробелы и разбиваем на строки по 64 символа
-                echo "$content" | tr -d '\r' | sed '/^$/d' | fold -w 64 >> "$temp_file"
-                echo "-----END ${tag^^}-----" >> "$temp_file"
-                echo "</$tag>" >> "$temp_file"
-            else
-                echo "$line" >> "$temp_file"
-            fi
-        done < "$config_file"
+        # Извлекаем клиентский ключ
+        sed -n '/<key>/,/<\/key>/p' "$config_file" | sed '1d;$d' > "$cert_dir/client.key"
+        
+        # Извлекаем CA сертификат
+        sed -n '/<ca>/,/<\/ca>/p' "$config_file" | sed '1d;$d' > "$cert_dir/ca.crt"
+        
+        # Извлекаем TLS ключ если есть
+        if grep -q "<tls-auth>" "$config_file"; then
+            sed -n '/<tls-auth>/,/<\/tls-auth>/p' "$config_file" | sed '1d;$d' > "$cert_dir/ta.key"
+        fi
+        
+        # Создаем новую конфигурацию с ссылками на файлы
+        cat > "$temp_file" << EOF
+client
+dev tun
+proto udp
+remote $(grep "^remote" "$config_file" | head -1 | awk '{print $2, $3}')
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+auth SHA256
+verb 3
+mute 20
+keepalive 10 30
+
+ca $cert_dir/ca.crt
+cert $cert_dir/client.crt
+key $cert_dir/client.key
+auth-user-pass auth.txt
+EOF
+        
+        # Добавляем tls-auth если был
+        if [ -f "$cert_dir/ta.key" ]; then
+            echo "tls-auth $cert_dir/ta.key 1" >> "$temp_file"
+        fi
         
         # Заменяем оригинальный файл
         mv "$temp_file" "$config_file"
         return 0
     fi
     
-    # Если нет inline тегов, но есть длинные base64 строки, возможно, это неправильно оформленные сертификаты
-    if grep -q "BEGIN CERTIFICATE" "$config_file" && ! grep -q "-----BEGIN CERTIFICATE-----" "$config_file"; then
-        log "  Исправление PEM формата..."
-        sed -i 's/BEGIN CERTIFICATE/-----BEGIN CERTIFICATE-----/g' "$config_file"
-        sed -i 's/END CERTIFICATE/-----END CERTIFICATE-----/g' "$config_file"
-        sed -i 's/BEGIN PRIVATE KEY/-----BEGIN PRIVATE KEY-----/g' "$config_file"
-        sed -i 's/END PRIVATE KEY/-----END PRIVATE KEY-----/g' "$config_file"
-        sed -i 's/BEGIN RSA PRIVATE KEY/-----BEGIN RSA PRIVATE KEY-----/g' "$config_file"
-        sed -i 's/END RSA PRIVATE KEY/-----END RSA PRIVATE KEY-----/g' "$config_file"
+    # Если нет тегов, проверяем обычные PEM блоки
+    return 0
+}
+
+# Функция для преобразования inline сертификатов в отдельные файлы
+convert_inline_certs() {
+    local config_file="$1"
+    local config_name=$(basename "$config_file")
+    
+    # Если в файле есть теги, извлекаем сертификаты
+    if grep -q "<cert>" "$config_file"; then
+        extract_certs_to_files "$config_file"
+        return 0
+    fi
+    
+    # Если есть inline PEM блоки без тегов, конвертируем их
+    if grep -q "BEGIN CERTIFICATE" "$config_file" && grep -q "END CERTIFICATE" "$config_file"; then
+        # Создаем директорию для сертификатов
+        local cert_dir="${config_file%.ovpn}_certs"
+        mkdir -p "$cert_dir"
+        
+        # Используем awk для извлечения PEM блоков
+        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$config_file" > "$cert_dir/ca.crt"
+        awk '/BEGIN PRIVATE KEY/,/END PRIVATE KEY/' "$config_file" > "$cert_dir/client.key"
+        awk '/BEGIN RSA PRIVATE KEY/,/END RSA PRIVATE KEY/' "$config_file" > "$cert_dir/client.key" 2>/dev/null
+        
+        # Если есть client certificate
+        if grep -q "BEGIN CERTIFICATE" "$config_file" | grep -v "CA" | head -2; then
+            # Более сложное извлечение клиентского сертификата
+            sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$config_file" | tail -n +2 | head -n -1 > "$cert_dir/client.crt" 2>/dev/null
+        fi
+        
+        # Создаем упрощенную конфигурацию
+        local temp_file="${config_file}.new"
+        
+        # Сохраняем основные настройки
+        grep -E "^(remote|proto|dev|resolv-retry|nobind|persist)" "$config_file" > "$temp_file"
+        
+        # Добавляем ссылки на файлы сертификатов
+        echo "" >> "$temp_file"
+        echo "ca $cert_dir/ca.crt" >> "$temp_file"
+        echo "cert $cert_dir/client.crt" >> "$temp_file"
+        echo "key $cert_dir/client.key" >> "$temp_file"
+        echo "auth-user-pass auth.txt" >> "$temp_file"
+        echo "remote-cert-tls server" >> "$temp_file"
+        
+        # Добавляем стандартные параметры
+        echo "cipher AES-256-CBC" >> "$temp_file"
+        echo "auth SHA256" >> "$temp_file"
+        echo "verb 3" >> "$temp_file"
+        
+        mv "$temp_file" "$config_file"
     fi
     
     return 0
 }
 
-# Функция для стандартизации конфигурации
-standardize_config() {
-    local config_file="$1"
+# Функция для создания простой, но работающей конфигурации
+create_simple_config() {
+    local raw_config="$1"
+    local output_config="$2"
+    local ip="$3"
     
-    # 1. Удаляем BOM маркер если есть
-    sed -i '1s/^\xEF\xBB\xBF//' "$config_file" 2>/dev/null
+    # Извлекаем основные данные
+    local remote_line=$(grep "^remote" "$raw_config" | head -1)
+    local remote_server=$(echo "$remote_line" | awk '{print $2}')
+    local remote_port=$(echo "$remote_line" | awk '{print $3}')
+    remote_port=${remote_port:-1194}
     
-    # 2. Преобразуем Windows концы строк
-    dos2unix -q "$config_file" 2>/dev/null || tr -d '\r' < "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+    # Создаем директорию для сертификатов
+    local cert_dir="${output_config%.ovpn}_certs"
+    mkdir -p "$cert_dir"
     
-    # 3. Исправляем inline сертификаты
-    fix_inline_certs "$config_file"
-    
-    # 4. Добавляем auth-user-pass если нет
-    if ! grep -q "^auth-user-pass" "$config_file"; then
-        echo "" >> "$config_file"
-        echo "auth-user-pass auth.txt" >> "$config_file"
+    # Пытаемся извлечь сертификаты разными способами
+    if grep -q "<cert>" "$raw_config"; then
+        # Из тегов
+        sed -n '/<cert>/,/<\/cert>/p' "$raw_config" | sed '1d;$d' | sed '/^$/d' > "$cert_dir/client.crt"
+        sed -n '/<key>/,/<\/key>/p' "$raw_config" | sed '1d;$d' | sed '/^$/d' > "$cert_dir/client.key"
+        sed -n '/<ca>/,/<\/ca>/p' "$raw_config" | sed '1d;$d' | sed '/^$/d' > "$cert_dir/ca.crt"
+    else
+        # Из PEM блоков
+        awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' "$raw_config" | tail -n +2 | head -n -1 > "$cert_dir/ca.crt" 2>/dev/null
+        awk '/-----BEGIN PRIVATE KEY-----/,/-----END PRIVATE KEY-----/' "$raw_config" | tail -n +2 | head -n -1 > "$cert_dir/client.key" 2>/dev/null
+        awk '/-----BEGIN RSA PRIVATE KEY-----/,/-----END RSA PRIVATE KEY-----/' "$raw_config" | tail -n +2 | head -n -1 > "$cert_dir/client.key" 2>/dev/null
     fi
     
-    # 5. Добавляем стандартные параметры
-    STANDARD_OPTS=(
-        "client"
-        "dev tun"
-        "proto udp"
-        "resolv-retry infinite"
-        "nobind"
-        "persist-key"
-        "persist-tun"
-        "remote-cert-tls server"
-        "cipher AES-256-CBC"
-        "auth SHA256"
-        "verb 3"
-        "mute 20"
-        "keepalive 10 30"
-    )
-    
-    for opt in "${STANDARD_OPTS[@]}"; do
-        if ! grep -q "^${opt}" "$config_file"; then
-            echo "$opt" >> "$config_file"
+    # Проверяем, что файлы не пустые
+    for cert_file in "$cert_dir/client.crt" "$cert_dir/client.key" "$cert_dir/ca.crt"; do
+        if [ ! -s "$cert_file" ]; then
+            # Пробуем другой метод извлечения
+            if [ "$cert_file" = "$cert_dir/ca.crt" ]; then
+                grep -A 100 "BEGIN CERTIFICATE" "$raw_config" | grep -B 100 "END CERTIFICATE" | sed '/^--$/d' > "$cert_file" 2>/dev/null
+            fi
         fi
     done
     
-    # 6. Удаляем дубликаты и пустые строки
-    awk '!seen[$0]++ && NF' "$config_file" > "${config_file}.tmp"
-    mv "${config_file}.tmp" "$config_file"
+    # Создаем простую конфигурацию
+    cat > "$output_config" << EOF
+client
+dev tun
+proto udp
+remote $remote_server $remote_port
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+auth SHA256
+verb 2
+mute 20
+
+ca $cert_dir/ca.crt
+cert $cert_dir/client.crt
+key $cert_dir/client.key
+auth-user-pass auth.txt
+EOF
+    
+    # Проверяем, есть ли tls-auth
+    if grep -q "<tls-auth>" "$raw_config"; then
+        sed -n '/<tls-auth>/,/<\/tls-auth>/p' "$raw_config" | sed '1d;$d' | sed '/^$/d' > "$cert_dir/ta.key"
+        echo "tls-auth $cert_dir/ta.key 1" >> "$output_config"
+    fi
+    
+    # Удаляем пустые строки
+    sed -i '/^$/d' "$output_config"
     
     return 0
 }
@@ -128,15 +211,6 @@ for cmd in curl openvpn ip base64; do
     fi
 done
 
-# Проверка дополнительных зависимостей
-for cmd in dos2unix fold; do
-    if ! command -v "$cmd" &>/dev/null; then
-        log "⚠️  Установите $cmd для лучшей обработки файлов"
-        log "  Ubuntu/Debian: sudo apt install $cmd"
-        log "  CentOS/RHEL: sudo yum install $cmd"
-    fi
-done
-
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
 cd "$WORK_DIR" || exit 1
 
@@ -144,27 +218,17 @@ cd "$WORK_DIR" || exit 1
 download_csv() {
     local url=$1
     local output=$2
-    local attempt=1
-    local max_attempts=3
     
-    while [ $attempt -le $max_attempts ]; do
-        log "Попытка $attempt/$max_attempts: загрузка с $url"
-        
-        curl -s --connect-timeout 30 --max-time 60 \
-             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-             "$url" -o "$output"
-        
-        # Проверяем результат
-        if [ -f "$output" ] && [ -s "$output" ]; then
-            if ! grep -q "<html\|<!DOCTYPE" "$output" 2>/dev/null; then
-                log "✓ CSV успешно загружен ($(wc -l < "$output") строк)"
-                return 0
-            fi
-        fi
-        
-        sleep 2
-        ((attempt++))
-    done
+    log "Загрузка с $url"
+    
+    curl -s --connect-timeout 30 --max-time 60 \
+         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+         "$url" -o "$output"
+    
+    if [ -f "$output" ] && [ -s "$output" ] && ! grep -q "<html\|<!DOCTYPE" "$output" 2>/dev/null; then
+        log "✓ CSV загружен ($(wc -l < "$output") строк)"
+        return 0
+    fi
     
     return 1
 }
@@ -177,26 +241,19 @@ elif download_csv "$ALTERNATE_URL" "servers.csv"; then
     log "Альтернативный URL сработал"
 else
     log "❌ Не удалось загрузить CSV файл"
-    echo "Проблемы с доступом к VPN Gate API"
     exit 1
 fi
 
-# Пропускаем заголовок (обычно 2 строки)
+# Пропускаем заголовок
 tail -n +3 servers.csv > data.csv 2>/dev/null
-
 if [ ! -s data.csv ]; then
     cp servers.csv data.csv
-fi
-
-if [ ! -s data.csv ]; then
-    log "❌ CSV пуст или содержит недостаточно данных"
-    exit 1
 fi
 
 # Создаем auth.txt
 echo -e "${AUTH_LOGIN}\n${AUTH_PASS}" > auth.txt
 
-# Парсим CSV и создаем конфигурации
+# Парсим CSV
 log "Парсинг CSV и создание .ovpn файлов..."
 LINE_NUM=0
 OVPN_COUNT=0
@@ -204,53 +261,45 @@ OVPN_COUNT=0
 while IFS= read -r line || [ -n "$line" ]; do
     ((LINE_NUM++))
     
-    # Удаляем Windows-символы
     line=$(echo "$line" | tr -d '\r')
-    [ -z "$line" ] || [ "$line" = "*" ] && continue
+    [ -z "$line" ] && continue
     
-    # Извлекаем IP (второе поле)
+    # Извлекаем IP
     IP=$(echo "$line" | awk -F',' '{print $2}' | sed 's/"//g')
     
-    # Ищем поле с base64 (обычно последнее непустое поле)
+    # Ищем поле с base64 (последнее поле)
     FIELD_COUNT=$(echo "$line" | awk -F',' '{print NF}')
-    BASE64_FIELD=""
+    BASE64_FIELD=$(echo "$line" | awk -F',' -v f="$FIELD_COUNT" '{print $f}' | sed 's/"//g')
     
-    # Ищем с конца
-    for ((i=FIELD_COUNT; i>=1; i--)); do
-        FIELD=$(echo "$line" | awk -F',' -v i="$i" '{print $i}' | sed 's/"//g')
-        # Пропускаем пустые или короткие поля
-        if [ -n "$FIELD" ] && [ "$FIELD" != "0" ] && [ ${#FIELD} -gt 100 ]; then
-            BASE64_FIELD="$FIELD"
-            break
-        fi
-    done
-    
-    if [ -z "$BASE64_FIELD" ]; then
+    if [ -z "$BASE64_FIELD" ] || [ "$BASE64_FIELD" = "0" ]; then
         continue
     fi
     
     # Декодируем
     DECODED=$(echo "$BASE64_FIELD" | base64 -d 2>/dev/null)
-    if [ $? -ne 0 ]; then
+    if [ $? -ne 0 ] || [ -z "$DECODED" ]; then
         continue
     fi
     
     # Проверяем, что это OpenVPN конфигурация
-    if echo "$DECODED" | grep -q -i "openvpn\|client\|remote\|dev tun"; then
-        FILENAME="vpngate_${IP:-server_$LINE_NUM}.ovpn"
+    if echo "$DECODED" | grep -q -i "openvpn\|client\|remote\|BEGIN CERTIFICATE"; then
+        # Сохраняем сырые данные
+        RAW_FILE="raw_${IP:-server_$LINE_NUM}.ovpn"
+        echo "$DECODED" > "$RAW_FILE"
         
-        # Сохраняем сырую конфигурацию
-        echo "$DECODED" > "$FILENAME"
+        # Создаем рабочую конфигурацию
+        CONFIG_FILE="vpngate_${IP:-server_$LINE_NUM}.ovpn"
         
-        if [ -s "$FILENAME" ]; then
-            # Стандартизируем конфигурацию
-            standardize_config "$FILENAME"
-            
+        create_simple_config "$RAW_FILE" "$CONFIG_FILE" "$IP"
+        
+        if [ -s "$CONFIG_FILE" ]; then
             ((OVPN_COUNT++))
-            echo "✓ Создан: $FILENAME"
+            echo "✓ Создан: $CONFIG_FILE"
         else
-            rm -f "$FILENAME" 2>/dev/null
+            rm -f "$CONFIG_FILE" 2>/dev/null
         fi
+        
+        rm -f "$RAW_FILE" 2>/dev/null
     fi
 done < data.csv
 
@@ -268,50 +317,25 @@ ORIGINAL_IP=$(timeout 10 curl -s --max-time 8 https://api.ipify.org 2>/dev/null 
               echo "неизвестен")
 log "Текущий IP: $ORIGINAL_IP"
 
-# Функция быстрой проверки конфигурации
-quick_check_config() {
-    local config="$1"
-    
-    # Проверяем обязательные секции
-    local has_cert=$(grep -c "BEGIN CERTIFICATE\|<cert>" "$config")
-    local has_key=$(grep -c "BEGIN PRIVATE KEY\|<key>" "$config")
-    local has_ca=$(grep -c "BEGIN CERTIFICATE.*CA\|<ca>" "$config")
-    local has_remote=$(grep -c "^remote " "$config")
-    
-    if [ "$has_remote" -eq 0 ]; then
-        echo "❌ Нет remote директивы"
-        return 1
-    fi
-    
-    if [ "$has_cert" -eq 0 ] || [ "$has_key" -eq 0 ] || [ "$has_ca" -eq 0 ]; then
-        echo "⚠️  Отсутствуют сертификаты/ключи"
-        # Попробуем исправить
-        standardize_config "$config"
-    fi
-    
-    return 0
-}
-
-# Основная функция тестирования
+# Функция тестирования конфигурации
 test_ovpn_config() {
     local config="$1"
     local config_name=$(basename "$config")
-    local pid_file="./logs/${config_name}.pid"
-    local log_file="./logs/${config_name}.log"
-    mkdir -p ./logs
+    local pid_file="/tmp/${config_name}.pid"
+    local log_file="/tmp/${config_name}.log"
     
     echo -n "Тест $config_name ... "
     
-    # Быстрая проверка конфигурации
-    if ! quick_check_config "$config"; then
+    # Проверяем основные параметры
+    if ! grep -q "^remote " "$config"; then
+        echo "❌ нет remote"
         return 1
     fi
     
-    # Извлекаем информацию о сервере
-    REMOTE_LINE=$(grep "^remote " "$config" | head -1)
-    SERVER=$(echo "$REMOTE_LINE" | awk '{print $2}')
-    PORT=$(echo "$REMOTE_LINE" | awk '{print $3}')
-    PORT=${PORT:-1194}
+    if ! grep -q "^ca " "$config" || ! grep -q "^cert " "$config" || ! grep -q "^key " "$config"; then
+        echo "❌ нет сертификатов"
+        return 1
+    fi
     
     # Запускаем OpenVPN
     sudo openvpn \
@@ -319,105 +343,81 @@ test_ovpn_config() {
         --daemon \
         --writepid "$pid_file" \
         --log "$log_file" \
-        --verb 2 \
-        --connect-timeout 30 \
+        --verb 1 \
+        --connect-timeout 20 \
         --auth-user-pass auth.txt
     
     # Ждем подключения
-    CONNECTED=0
-    for i in {1..30}; do
+    for i in {1..20}; do
         if [ -f "$log_file" ] && grep -q "Initialization Sequence Completed" "$log_file" 2>/dev/null; then
-            CONNECTED=1
-            break
+            sleep 2
+            NEW_IP=$(timeout 5 curl -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '\n\r')
+            
+            if [ -n "$NEW_IP" ] && [ "$NEW_IP" != "$ORIGINAL_IP" ]; then
+                echo "✅ РАБОТАЕТ (IP: $NEW_IP)"
+                
+                # Сохраняем рабочую конфигурацию
+                cp "$config" "$OUTPUT_DIR/"
+                # Копируем директорию с сертификатами
+                cert_dir="${config%.ovpn}_certs"
+                if [ -d "$cert_dir" ]; then
+                    cp -r "$cert_dir" "$OUTPUT_DIR/"
+                fi
+                
+                # Останавливаем OpenVPN
+                if [ -f "$pid_file" ]; then
+                    sudo kill $(cat "$pid_file") 2>/dev/null
+                    sleep 1
+                fi
+                
+                return 0
+            else
+                echo "⚠️  подключено, IP: $NEW_IP"
+                break
+            fi
         fi
         
-        # Проверяем на ошибки
+        # Проверяем ошибки
         if [ -f "$log_file" ]; then
             if grep -q "AUTH_FAILED\|TLS Error\|Cannot load\|no start line" "$log_file"; then
+                ERROR=$(grep -i "error\|fail\|cannot" "$log_file" | tail -1)
+                echo "❌ ${ERROR:0:50}"
                 break
             fi
         fi
         
         sleep 1
-        if [ $((i % 5)) -eq 0 ]; then echo -n "."; fi
     done
-    
-    if [ $CONNECTED -eq 1 ]; then
-        sleep 2
-        NEW_IP=$(timeout 5 curl -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '\n\r')
-        
-        if [ -n "$NEW_IP" ] && [ "$NEW_IP" != "$ORIGINAL_IP" ]; then
-            echo "✅ РАБОТАЕТ (IP: $NEW_IP)"
-            
-            # Сохраняем рабочую конфигурацию
-            cp "$config" "$OUTPUT_DIR/"
-            echo "$config_name - $SERVER:$PORT - $NEW_IP" >> "$OUTPUT_DIR/success.txt"
-            
-            # Останавливаем OpenVPN
-            if [ -f "$pid_file" ]; then
-                sudo kill $(cat "$pid_file") 2>/dev/null
-                sleep 1
-            fi
-            
-            return 0
-        else
-            echo "⚠️  подключено, но IP: $NEW_IP"
-        fi
-    fi
-    
-    # Анализируем ошибку
-    if [ -f "$log_file" ]; then
-        ERROR_MSG=""
-        if grep -q "Cannot load inline certificate" "$log_file"; then
-            ERROR_MSG="проблема с сертификатами"
-            # Пробуем пересоздать конфигурацию с правильными тегами
-            echo "$DECODED" > "${config}.raw"
-            fix_inline_certs "${config}.raw"
-            cp "${config}.raw" "$config"
-        elif grep -q "AUTH_FAILED" "$log_file"; then
-            ERROR_MSG="ошибка аутентификации"
-        elif grep -q "TLS Error" "$log_file"; then
-            ERROR_MSG="ошибка TLS"
-        elif grep -q "Connection refused" "$log_file"; then
-            ERROR_MSG="сервер недоступен"
-        elif grep -q "no start line" "$log_file"; then
-            ERROR_MSG="неверный формат сертификата"
-        else
-            # Показываем последнюю строку ошибки
-            ERROR_MSG=$(tail -n 3 "$log_file" | grep -i "error\|fail\|cannot" | tail -1 || echo "неизвестная ошибка")
-        fi
-        echo "❌ $ERROR_MSG"
-    else
-        echo "❌ не удалось подключиться"
-    fi
     
     # Останавливаем OpenVPN
     if [ -f "$pid_file" ]; then
         sudo kill $(cat "$pid_file") 2>/dev/null
         sleep 1
     fi
-    sudo pkill -f "openvpn.*$config_name" 2>/dev/null
-    sleep 1
     
-    rm -f "$pid_file" "$log_file" 2>/dev/null
     return 1
 }
 
 # Тестируем конфигурации
-log "Тестируем конфигурации (первые 10)..."
+log "Тестируем конфигурации..."
 WORKING=0
 TESTED=0
 
-# Берем только первые 10 для теста
-for f in $(ls *.ovpn 2>/dev/null | head -10); do
+for f in vpngate_*.ovpn; do
     if [ -f "$f" ]; then
         ((TESTED++))
         
         if test_ovpn_config "$f"; then
             ((WORKING++))
-            if [ "$WORKING" -ge 2 ]; then
+            if [ "$WORKING" -ge 3 ]; then
+                log "Найдено 3 рабочих конфигурации"
                 break
             fi
+        fi
+        
+        if [ "$TESTED" -ge 15 ]; then
+            log "Протестировано 15 конфигураций"
+            break
         fi
     fi
 done
@@ -434,39 +434,23 @@ echo ""
 
 if [ "$WORKING" -gt 0 ]; then
     echo "✅ Найдено рабочих VPN серверов!"
+    echo "Конфигурации сохранены в: $OUTPUT_DIR"
     echo ""
-    echo "Рабочие конфигурации в: $OUTPUT_DIR"
-    
-    # Создаем простой скрипт для запуска
-    cat > "$OUTPUT_DIR/start_vpn.sh" << 'EOF'
-#!/bin/bash
-echo "Выберите VPN конфигурацию:"
-ls *.ovpn | cat -n
-echo -n "Номер: "
-read num
-config=$(ls *.ovpn | sed -n "${num}p")
-if [ -f "$config" ]; then
-    echo "Запуск: $config"
-    sudo openvpn --config "$config"
-else
-    echo "Ошибка!"
-fi
-EOF
-    chmod +x "$OUTPUT_DIR/start_vpn.sh"
-    echo "Для запуска: cd \"$OUTPUT_DIR\" && sudo ./start_vpn.sh"
+    echo "Для подключения:"
+    echo "1. cd \"$OUTPUT_DIR\""
+    echo "2. sudo openvpn --config ИМЯ_ФАЙЛА.ovpn"
 else
     echo "❌ Не найдено рабочих конфигураций"
     echo ""
-    echo "СОВЕТЫ:"
-    echo "1. VPN Gate может быть временно недоступен"
-    echo "2. Попробуйте запустить скрипт позже"
-    echo "3. Проверьте вручную: sudo openvpn --config любой.ovpn"
+    echo "ПОПРОБУЙТЕ ЭТО:"
+    echo "1. Проверить файлы сертификатов вручную:"
+    echo "   ls *_certs/"
+    echo "2. Проверить один конфиг вручную:"
+    echo "   sudo openvpn --config vpngate_XXX.ovpn"
+    echo "3. VPN Gate может быть временно недоступен"
 fi
 
 echo "========================================"
-
-# Сохраняем auth.txt
-cp auth.txt "$OUTPUT_DIR/" 2>/dev/null
 
 # Очистка
 rm -rf "$WORK_DIR"
