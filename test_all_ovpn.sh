@@ -57,55 +57,63 @@ echo -e "${AUTH_LOGIN}\n${AUTH_PASS}" > auth.txt
 LINE_NUM=0
 OVPN_COUNT=0
 
+# Проанализируем структуру CSV
+echo "Анализ структуры CSV..."
+head -n 1 data.csv | awk -F',' '{print "Количество полей: " NF}'
+
 while IFS= read -r line; do
     ((LINE_NUM++))
-
+    
     # Удаляем Windows-символы
     line=$(echo "$line" | tr -d '\r')
     [ -z "$line" ] && continue
-
-    # Разбиваем по запятым, сохраняя кавычки
-    IFS=',' read -ra FIELDS <<< "$line"
-
-    # Нужно минимум 15 полей
-    if [ ${#FIELDS[@]} -lt 15 ]; then
-        continue
-    fi
-
-    # IP из второго поля
-    IP="${FIELDS[1]}"
-
-    # Base64 из последнего поля (поле 15, индекс 14)
-    BASE64_FIELD="${FIELDS[14]}"
-
-    # Убираем кавычки если есть
-    BASE64_FIELD=$(echo "$BASE64_FIELD" | sed 's/^";//; s/";$//; s/\\\\\"/"/g')
-
-    # Дополнительная проверка base64
-    if [[ ${#BASE64_FIELD} -gt 200 ]] && [[ "$BASE64_FIELD" != "0" ]] &&
-       echo "$BASE64_FIELD" | base64 -d 2>/dev/null | grep -q "client"; then
-
-        FILENAME="vpngate_${IP:-unknown_$LINE_NUM}.ovpn"
-
-        # Декодируем base64
-        echo "$BASE64_FIELD" | base64 -d > "$FILENAME" 2>/dev/null
-
-        if [ -s "$FILENAME" ]; then
-            # Добавляем auth-user-pass если нет
-            if ! grep -q "auth-user-pass" "$FILENAME"; then
-                echo "auth-user-pass auth.txt" >> "$FILENAME"
-            fi
-
-            # Проверяем, что файл содержит минимально необходимые настройки
-            if grep -q "remote " "$FILENAME" && grep -q "client" "$FILENAME"; then
+    
+    # Используем awk для более надежного парсинга
+    IP=$(echo "$line" | awk -F',' '{print $2}')
+    BASE64_FIELD=$(echo "$line" | awk -F',' '{print $NF}')  # Последнее поле
+    
+    # Убираем ВСЕ кавычки
+    BASE64_FIELD=$(echo "$BASE64_FIELD" | sed 's/^"//g; s/"$//g; s/\"//g')
+    
+    # Проверяем, что это похоже на base64
+    if [[ ${#BASE64_FIELD} -gt 200 ]] && [[ "$BASE64_FIELD" != "0" ]]; then
+        
+        # Декодируем и проверяем
+        DECODED=$(echo "$BASE64_FIELD" | base64 -d 2>/dev/null)
+        if echo "$DECODED" | grep -q "client\|remote"; then
+            FILENAME="vpngate_${IP:-unknown_$LINE_NUM}.ovpn"
+            
+            # Сохраняем декодированные данные
+            echo "$DECODED" > "$FILENAME"
+            
+            if [ -s "$FILENAME" ]; then
+                # Добавляем auth-user-pass если нет
+                if ! grep -q "auth-user-pass" "$FILENAME"; then
+                    echo "" >> "$FILENAME"
+                    echo "auth-user-pass auth.txt" >> "$FILENAME"
+                fi
+                
+                # Добавляем дополнительные настройки для надежности
+                if ! grep -q "persist-key" "$FILENAME"; then
+                    echo "persist-key" >> "$FILENAME"
+                fi
+                if ! grep -q "persist-tun" "$FILENAME"; then
+                    echo "persist-tun" >> "$FILENAME"
+                fi
+                if ! grep -q "nobind" "$FILENAME"; then
+                    echo "nobind" >> "$FILENAME"
+                fi
+                
                 ((OVPN_COUNT++))
-                echo "✓ Создан: $FILENAME"
+                echo "✓ Создан: $FILENAME (длина base64: ${#BASE64_FIELD})"
             else
-                rm -f "$FILENAME"
+                rm -f "$FILENAME" 2>/dev/null
             fi
         else
-            rm -f "$FILENAME" 2>/dev/null
+            echo "✗ Строка $LINE_NUM: не содержит client/remote директив"
         fi
+    else
+        echo "✗ Строка $LINE_NUM: слишком короткая или '0' (длина: ${#BASE64_FIELD})"
     fi
 done < data.csv
 
@@ -114,126 +122,333 @@ echo "Создано $OVPN_COUNT .ovpn файлов."
 if [ "$OVPN_COUNT" -eq 0 ]; then
     echo "❌ Не создано ни одного .ovpn файла."
     echo "Проверьте формат CSV. Возможно, изменилась структура."
+    
+    # Покажем пример строки для отладки
+    echo "=== Пример строки CSV ==="
+    head -n 1 data.csv
+    echo "=== Последнее поле ==="
+    head -n 1 data.csv | awk -F',' '{print $NF}' | head -c 100
+    echo "..."
     exit 1
 fi
 
 # Проверка текущего IP
-echo "Текущий IP:"
+echo "Проверка текущего IP..."
 ORIGINAL_IP=$(timeout 10 curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "неизвестен")
-echo "$ORIGINAL_IP"
+echo "Текущий IP: $ORIGINAL_IP"
 
-# Улучшенная функция тестирования
-test_ovpn() {
+# Функция для диагностики с использованием Python
+diagnose_ovpn() {
     local config="$1"
-    local PID_FILE="/tmp/vpngate_pid_$$"
-    local LOG_FILE="/tmp/vpngate_log_$$"
-    local TUN_IFACE=""
-    local TIMEOUT=20
+    local log_file="/tmp/vpngate_diagnose_$$.log"
+    
+    cat > /tmp/diagnose.py << 'PYEOF'
+#!/usr/bin/env python3
+import subprocess
+import time
+import os
+import sys
 
-    # Запуск OpenVPN
+def diagnose_vpn(config_file):
+    print(f"\n🔍 Диагностика конфигурации: {config_file}")
+    
+    # 1. Проверяем содержимое конфигурации
+    with open(config_file, 'r') as f:
+        content = f.read()
+    
+    required_directives = ['remote', 'client', 'ca', 'cert', 'key']
+    missing = []
+    for directive in required_directives:
+        if directive not in content:
+            missing.append(directive)
+    
+    if missing:
+        print(f"  ❌ Отсутствуют обязательные директивы: {', '.join(missing)}")
+    
+    # Извлекаем адрес сервера
+    remote_lines = [l for l in content.split('\n') if l.startswith('remote ')]
+    if remote_lines:
+        server = remote_lines[0].split()[1]
+        port = remote_lines[0].split()[2] if len(remote_lines[0].split()) > 2 else '1194'
+        print(f"  ℹ️  Сервер: {server}:{port}")
+        
+        # Проверяем доступность порта
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            result = sock.connect_ex((server, int(port)))
+            if result == 0:
+                print(f"  ✅ Порт {port} доступен")
+            else:
+                print(f"  ❌ Порт {port} недоступен")
+            sock.close()
+        except Exception as e:
+            print(f"  ⚠️  Не удалось проверить порт: {e}")
+    
+    # 2. Запускаем OpenVPN в режиме тестирования
+    print("  🚀 Запуск OpenVPN для тестирования...")
+    
+    # Убиваем старые процессы
+    subprocess.run(['sudo', 'pkill', '-f', f'openvpn.*{os.path.basename(config_file)}'], 
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Запускаем OpenVPN
+    log_file = f"/tmp/openvpn_test_{int(time.time())}.log"
+    process = subprocess.Popen([
+        'sudo', 'openvpn',
+        '--config', config_file,
+        '--verb', '3',
+        '--connect-timeout', '20',
+        '--log', log_file
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    # Ждем 15 секунд
+    time.sleep(15)
+    
+    # Проверяем логи
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            logs = f.read()
+        
+        if 'Initialization Sequence Completed' in logs:
+            print("  ✅ Успешное подключение")
+            
+            # Проверяем IP
+            import requests
+            try:
+                new_ip = requests.get('https://api.ipify.org', timeout=5).text
+                print(f"  🌐 Новый IP: {new_ip}")
+            except:
+                print("  ⚠️  Не удалось проверить новый IP")
+            
+            result = True
+        elif 'AUTH_FAILED' in logs:
+            print("  ❌ Ошибка аутентификации")
+            result = False
+        elif 'TLS Error' in logs:
+            print("  ❌ Ошибка TLS")
+            result = False
+        elif 'Connection refused' in logs or 'No route to host' in logs:
+            print("  ❌ Сервер недоступен")
+            result = False
+        else:
+            print("  ⚠️  Неизвестная ошибка (проверьте логи)")
+            # Показываем последние строки лога
+            last_lines = '\n'.join(logs.strip().split('\n')[-5:])
+            print(f"  📋 Последние строки лога:\n{last_lines}")
+            result = False
+    else:
+        print("  ❌ Лог-файл не создан")
+        result = False
+    
+    # Останавливаем процесс
+    process.terminate()
+    subprocess.run(['sudo', 'pkill', '-f', f'openvpn.*{os.path.basename(config_file)}'])
+    
+    # Удаляем временный файл
+    if os.path.exists(log_file):
+        os.remove(log_file)
+    
+    return result
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Использование: python3 diagnose.py <config.ovpn>")
+        sys.exit(1)
+    
+    success = diagnose_vpn(sys.argv[1])
+    sys.exit(0 if success else 1)
+PYEOF
+
+    chmod +x /tmp/diagnose.py
+    python3 /tmp/diagnose.py "$config"
+    return $?
+}
+
+# Основная функция тестирования с расширенной диагностикой
+test_ovpn_with_diagnosis() {
+    local config="$1"
+    local config_name=$(basename "$config")
+    local pid_file="/tmp/vpngate_${config_name}_pid"
+    local log_file="/tmp/vpngate_${config_name}_log"
+    
+    echo -n "Тест $config_name ... "
+    
+    # Проверяем файл конфигурации
+    if [ ! -s "$config" ]; then
+        echo "❌ пустой файл"
+        return 1
+    fi
+    
+    # Проверяем необходимые директивы
+    if ! grep -q "remote " "$config"; then
+        echo "❌ нет remote директивы"
+        return 1
+    fi
+    
+    # Извлекаем информацию о сервере
+    REMOTE_LINE=$(grep "remote " "$config" | head -1)
+    SERVER=$(echo "$REMOTE_LINE" | awk '{print $2}')
+    PORT=$(echo "$REMOTE_LINE" | awk '{print $3}')
+    PORT=${PORT:-1194}
+    
+    # Проверяем доступность сервера (только если не Japan)
+    if [[ ! "$SERVER" =~ \.jp$ ]] && [[ "$SERVER" != "unknown"* ]]; then
+        if ! timeout 3 nc -z "$SERVER" "$PORT" 2>/dev/null; then
+            echo "❌ сервер $SERVER:$PORT недоступен"
+            return 1
+        fi
+    fi
+    
+    # Запускаем OpenVPN с расширенным логом
     sudo openvpn \
         --config "$config" \
         --daemon \
-        --writepid "$PID_FILE" \
-        --log "$LOG_FILE" \
-        --auth-nocache \
-        --connect-timeout 15 \
-        --verb 0 \
-        --proto udp
-
-    # Ждем создания tun интерфейса
-    for i in {1..30}; do
-        TUN_IFACE=$(ip -o link show 2>/dev/null | grep -o 'tun[0-9]' | head -n1)
-        if [ -n "$TUN_IFACE" ]; then
+        --writepid "$pid_file" \
+        --log "$log_file" \
+        --verb 3 \
+        --connect-timeout 25 \
+        --auth-retry interact
+    
+    # Ждем подключения
+    CONNECTED=0
+    for i in {1..40}; do
+        if grep -q "Initialization Sequence Completed" "$log_file" 2>/dev/null; then
+            CONNECTED=1
             break
         fi
         sleep 1
     done
-
-    if [ -z "$TUN_IFACE" ]; then
-        echo "  ⚠ Нет tun интерфейса" >&2
-        sudo pkill -f "openvpn.*$config" 2>/dev/null
-        return 1
-    fi
-
-    # Ждем установки маршрутов
-    sleep 3
-
-    # Проверяем IP через несколько сервисов
-    local NEW_IP=""
-    for service in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me/ip"; do
-        NEW_IP=$(timeout 8 curl -s --max-time 5 "$service" 2>/dev/null)
-        if [ -n "$NEW_IP" ]; then
-            break
+    
+    if [ $CONNECTED -eq 1 ]; then
+        # Проверяем IP
+        sleep 3
+        NEW_IP=$(timeout 10 curl -s --max-time 8 https://api.ipify.org 2>/dev/null)
+        
+        if [ -n "$NEW_IP" ] && [ "$NEW_IP" != "$ORIGINAL_IP" ]; then
+            echo "✅ РАБОТАЕТ (IP: $NEW_IP)"
+            # Копируем успешную конфигурацию
+            cp "$config" "$OUTPUT_DIR/"
+            
+            # Сохраняем информацию о сервере
+            echo "$config_name - $SERVER:$PORT - $NEW_IP" >> "$OUTPUT_DIR/success.txt"
+            return 0
+        else
+            echo "⚠️  подключено, но IP не изменился"
         fi
-    done
-
-    # Останавливаем OpenVPN
-    sudo pkill -f "openvpn.*$config" 2>/dev/null
-    sleep 2
-
-    # Чистим интерфейс
-    sudo ip link delete "$TUN_IFACE" 2>/dev/null
-    rm -f "$PID_FILE" "$LOG_FILE"
-
-    # Проверяем результат
-    if [ -n "$NEW_IP" ] && [ "$NEW_IP" != "$ORIGINAL_IP" ]; then
-        echo "  ✅ IP изменен: $NEW_IP" >&2
-        return 0
     else
-        echo "  ⚠ IP не изменился или ошибка" >&2
-        return 1
+        # Анализируем ошибку
+        if [ -f "$log_file" ]; then
+            ERROR_TYPE="неизвестная ошибка"
+            if grep -q "AUTH_FAILED" "$log_file"; then
+                ERROR_TYPE="ошибка аутентификации"
+            elif grep -q "TLS Error" "$log_file"; then
+                ERROR_TYPE="ошибка TLS"
+            elif grep -q "Connection refused" "$log_file"; then
+                ERROR_TYPE="сервер недоступен"
+            elif grep -q "No route to host" "$log_file"; then
+                ERROR_TYPE="нет маршрута"
+            fi
+            echo "❌ $ERROR_TYPE"
+        else
+            echo "❌ не удалось подключиться"
+        fi
     fi
+    
+    # Останавливаем OpenVPN
+    if [ -f "$pid_file" ]; then
+        sudo kill $(cat "$pid_file") 2>/dev/null
+    fi
+    sudo pkill -f "openvpn.*$config_name" 2>/dev/null
+    
+    # Удаляем временные файлы
+    rm -f "$pid_file" "$log_file"
+    
+    return 1
 }
 
-# Тестируем только первые 10 для экономии времени
-echo "Тестируем первые 10 конфигураций..."
+# Тестируем все конфигурации
+echo "Тестируем все $OVPN_COUNT конфигураций..."
 WORKING=0
 TESTED=0
+FAILED=0
 
-for f in *.ovpn; do
+# Сортируем файлы по размеру (сначала самые большие)
+for f in $(ls -S *.ovpn 2>/dev/null); do
     if [ -f "$f" ]; then
         ((TESTED++))
-        echo -n "Тест $TESTED: $f ... "
-
-        # Пропускаем если файл пустой
-        if [ ! -s "$f" ]; then
-            echo "пустой файл"
-            continue
-        fi
-
-        if test_ovpn "$f"; then
-            cp "$f" "$OUTPUT_DIR/"
-            echo "✅ РАБОТАЕТ"
+        
+        if test_ovpn_with_diagnosis "$f"; then
             ((WORKING++))
-
-            # Если нашли 3 рабочих, можно остановиться
-            if [ "$WORKING" -ge 3 ]; then
+            # Если нашли 5 рабочих, можно ускорить процесс
+            if [ "$WORKING" -ge 5 ]; then
                 echo "Найдено достаточно рабочих конфигураций"
                 break
             fi
         else
-            echo "❌"
+            ((FAILED++))
         fi
-
-        # Ограничиваем тестирование 10 файлами
-        if [ "$TESTED" -ge 10 ]; then
-            break
-        fi
+        
+        echo "Прогресс: $TESTED/$OVPN_COUNT (рабочих: $WORKING)"
     fi
 done
 
 # Копируем auth.txt
 cp auth.txt "$OUTPUT_DIR/" 2>/dev/null
 
+# Создаем итоговый отчет
 echo ""
 echo "========================================"
-echo "Результаты:"
-echo "  Протестировано: $TESTED"
-echo "  Рабочих: $WORKING"
-echo "  Сохранено в: $OUTPUT_DIR"
+echo "ИТОГОВЫЙ ОТЧЕТ"
+echo "========================================"
+echo "Всего конфигураций: $OVPN_COUNT"
+echo "Протестировано: $TESTED"
+echo "Рабочих: $WORKING"
+echo "Не рабочих: $FAILED"
+echo "Успешные конфигурации сохранены в: $OUTPUT_DIR"
+echo ""
+
+if [ "$WORKING" -gt 0 ]; then
+    echo "✅ Найдено рабочих конфигураций:"
+    if [ -f "$OUTPUT_DIR/success.txt" ]; then
+        cat "$OUTPUT_DIR/success.txt"
+    fi
+    
+    # Создаем скрипт для быстрого запуска
+    cat > "$OUTPUT_DIR/start_vpn.sh" << 'EOF'
+#!/bin/bash
+echo "Доступные VPN конфигурации:"
+ls *.ovpn | cat -n
+echo -n "Выберите номер: "
+read num
+config=$(ls *.ovpn | sed -n "${num}p")
+if [ -f "$config" ]; then
+    echo "Запуск $config..."
+    sudo openvpn --config "$config"
+else
+    echo "Неверный номер"
+fi
+EOF
+    chmod +x "$OUTPUT_DIR/start_vpn.sh"
+    echo "Для запуска используйте: $OUTPUT_DIR/start_vpn.sh"
+else
+    echo "❌ Рабочих конфигураций не найдено"
+    echo ""
+    echo "ВОЗМОЖНЫЕ ПРИЧИНЫ:"
+    echo "1. Серверы VPN Gate временно недоступны"
+    echo "2. Изменился формат API"
+    echo "3. Проблемы с сетью или брандмауэром"
+    echo "4. Учетные данные vpn/vpn больше не работают"
+    echo ""
+    echo "РЕКОМЕНДАЦИИ:"
+    echo "1. Проверьте https://www.vpngate.net/"
+    echo "2. Попробуйте вручную подключиться к одному из файлов"
+    echo "3. Проверьте логи в /tmp/vpngate_*_log"
+fi
+
 echo "========================================"
 
 # Очистка
 cd /tmp
-rm -rf "$WORK_DIR"
+rm -rf "$WORK_DIR" /tmp/diagnose.py
